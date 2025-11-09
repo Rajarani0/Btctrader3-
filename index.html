@@ -1,0 +1,238 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>BTC PRO V7 - Buy & Sell</title>
+    <link rel="manifest" href="data:application/manifest+json,{
+        'name': 'BTC PRO V7',
+        'short_name': 'BTCPro',
+        'start_url': '.',
+        'display': 'standalone',
+        'background_color': '#000',
+        'theme_color': '#f7931a',
+        'icons': [{'src': 'data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2280%22>₿</text></svg>', 'sizes': 'any'}]
+    }">
+    <style>
+        * { margin:0; padding:0; box-sizing:border-box; }
+        body { font-family: 'Segoe UI', sans-serif; background: #000; color: #fff; text-align:center; padding:20px; min-height:100vh; }
+        h1 { color:#f7931a; font-size:2.2rem; margin:15px 0; text-shadow: 0 0 10px #f7931a; }
+        #price { font-size:3.5rem; color:#0f0; margin:25px; font-weight:bold; text-shadow: 0 0 15px #0f0; }
+        #signal { font-size:1.4rem; margin:20px; padding:16px; border-radius:15px; font-weight:bold; }
+        .strong-buy { background:#1a4d1a; color:#0f0; border:2px solid #0f0; }
+        .strong-sell { background:#4d1a1a; color:#f00; border:2px solid #f00; }
+        .neutral { background:#4d4d1a; color:#ff0; border:2px solid #ff0; }
+        .btn { padding:16px 40px; background:#f7931a; color:#000; border:none; border-radius:50px; font-weight:bold; cursor:pointer; margin:15px; font-size:1.3rem; }
+        .btn:hover { background:#ff9500; }
+        #indicators { margin:20px; font-size:1rem; line-height:2; background:rgba(255,255,255,0.05); padding:15px; border-radius:12px; }
+        .footer { margin-top:30px; font-size:0.8rem; color:#888; }
+    </style>
+</head>
+<body>
+    <h1>BTC PRO V7</h1>
+    <div id="price">Connecting...</div>
+    <div id="indicators">Loading...</div>
+    <div id="signal" class="neutral">Checking Strategy...</div>
+    <button class="btn" onclick="checkNow()">CHECK NOW</button>
+    <div class="footer">Auto Buy & Sell Signals | 5/7 = STRONG</div>
+
+    <script>
+        const BOT_TOKEN = '8574700467:AAFOAvEMXSwVpvBxExF10U7MF3gMJ83a9WQ';
+        const CHAT_ID = '1349670684';
+
+        let lastSignalTime = 0;
+        const COOLDOWN = 3 * 60 * 1000;  // 3 min
+        let ws, price = 0, candles = [], volumes = [];
+
+        // -------------------------------------------------
+        // 1. SOUND (embedded Base64 – no external file)
+        // -------------------------------------------------
+        const alertSound = new Audio('data:audio/wav;base64,UklGRnoGAABXQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YQoGAACBhYqFbF1fdJivrJBhNjVgodDbq2EcBj+a2/LDciUFLIHO8tiJNwgZaLvt559NEAxQp+PwtmMcBjiR1/LMeSwFJHfH8N2QQAoUXrTp66hVFApGn+DyvmwhBSuBzvLYiTYIG2m98OScTgwOUarm7blmFgU7k9n1unEiBC13yO/eizEIHWq+8+OWT');
+
+        function playSound() {
+            alertSound.currentTime = 0;
+            alertSound.play().catch(() => {});
+        }
+
+        // -------------------------------------------------
+        // 2. BROWSER NOTIFICATION
+        // -------------------------------------------------
+        async function requestNotificationPermission() {
+            if (Notification.permission === 'default') {
+                await Notification.requestPermission();
+            }
+        }
+
+        function showNotification(title, body) {
+            if (Notification.permission === 'granted') {
+                new Notification(title, {
+                    body: body,
+                    icon: 'data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2280%22>₿</text></svg>'
+                });
+            }
+        }
+
+        // Ask permission on first load
+        requestNotificationPermission();
+
+        // -------------------------------------------------
+        // LIVE PRICE
+        // -------------------------------------------------
+        function connectWebSocket() {
+            ws = new WebSocket('wss://stream.binance.com:9443/ws/btcusdt@trade');
+            ws.onmessage = (event) => {
+                const data = JSON.parse(event.data);
+                price = parseFloat(data.p).toFixed(2);
+                document.getElementById('price').innerHTML = `<span style="color:#0f0;">BTC: $${price}</span>`;
+            };
+            ws.onclose = () => setTimeout(connectWebSocket, 1000);
+        }
+
+        // -------------------------------------------------
+        // 1MIN CANDLES + VOLUME
+        // -------------------------------------------------
+        async function fetchCandles() {
+            try {
+                const res = await fetch('https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=1m&limit=200');
+                const data = await res.json();
+                candles = data.map(d => parseFloat(d[4]));  // Close
+                volumes = data.map(d => parseFloat(d[5]));  // Volume
+                checkStrategy();
+            } catch (e) { console.error(e); }
+        }
+
+        // -------------------------------------------------
+        // TELEGRAM
+        // -------------------------------------------------
+        async function sendTelegram(msg) {
+            if (!BOT_TOKEN.includes(':')) return;
+            try {
+                await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage?chat_id=${CHAT_ID}&text=${encodeURIComponent(msg)}&parse_mode=Markdown`);
+            } catch (e) { console.error(e); }
+        }
+
+        // -------------------------------------------------
+        // STRATEGY + SIGNAL
+        // -------------------------------------------------
+        function checkStrategy() {
+            if (candles.length < 50) return;
+            const c = candles;
+            const v = volumes;
+
+            let scoreBuy = 0, scoreSell = 0;
+            let reasonsBuy = [], reasonsSell = [];
+
+            // 1. RSI
+            const rsi = calcRSI(c, 14);
+            if (rsi < 35) { scoreBuy++; reasonsBuy.push(`RSI ${rsi.toFixed(1)}`); }
+            if (rsi > 65) { scoreSell++; reasonsSell.push(`RSI ${rsi.toFixed(1)}`); }
+
+            // 2. MACD
+            const macd = calcMACD(c);
+            if (macd.line > macd.signal) { scoreBuy++; reasonsBuy.push('MACD Bull'); }
+            if (macd.line < macd.signal) { scoreSell++; reasonsSell.push('MACD Bear'); }
+
+            // 3. EMA
+            const ema50 = calcEMA(c, 50);
+            const ema200 = calcEMA(c, 200);
+            if (ema50 > ema200) { scoreBuy++; reasonsBuy.push('EMA Bull'); }
+            if (ema50 < ema200) { scoreSell++; reasonsSell.push('EMA Bear'); }
+
+            // 4. BB
+            const bb = calcBB(c, 20, 2);
+            if (c[c.length-1] > bb.upper) { scoreBuy++; reasonsBuy.push('BB Break Up'); }
+            if (c[c.length-1] < bb.lower) { scoreSell++; reasonsSell.push('BB Break Down'); }
+
+            // 5. Volume Spike
+            const avgVol = v.slice(0, -1).reduce((a,b)=>a+b,0)/(v.length-1);
+            if (v[v.length-1] > avgVol * 1.5) {
+                if (c[c.length-1] > c[c.length-2]) { scoreBuy++; reasonsBuy.push('Vol Spike'); }
+                else { scoreSell++; reasonsSell.push('Vol Dump'); }
+            }
+
+            // DISPLAY
+            document.getElementById('indicators').innerHTML = `
+                <div style="color:#f7931a;">BUY: ${scoreBuy}/5 | SELL: ${scoreSell}/5</div>
+                RSI: ${rsi.toFixed(1)} | MACD: ${macd.line.toFixed(2)} | EMA: ${ema50 > ema200 ? 'Bull' : 'Bear'} 
+                <br>BB: ${c[c.length-1] > bb.upper ? 'Up' : c[c.length-1] < bb.lower ? 'Down' : 'Hold'} | Vol: ${v[v.length-1] > avgVol*1.5 ? 'Spike' : 'Normal'}
+            `;
+
+            // AUTO SIGNALS
+            const entry = parseFloat(price);
+            if (scoreBuy >= 5 && (Date.now() - lastSignalTime > COOLDOWN)) {
+                const tp = (entry * 1.015).toFixed(2);
+                const sl = (entry * 0.994).toFixed(2);
+                const msg = `*BTC STRONG BUY* \nEntry: $${entry}\nTP: $${tp} (+1.5%)\nSL: $${sl} (-0.6%)\nRR: 1:2.5\n${reasonsBuy.join(' • ')}`;
+                sendTelegram(msg);
+                document.getElementById('signal').innerHTML = `<div class="strong-buy">STRONG BUY SENT!</div>`;
+                lastSignalTime = Date.now();
+
+                // *** SOUND + NOTIFICATION ***
+                playSound();
+                showNotification('BTC PRO V7 – STRONG BUY', `Entry $${entry} | TP $${tp} | SL $${sl}`);
+
+            } 
+            else if (scoreSell >= 5 && (Date.now() - lastSignalTime > COOLDOWN)) {
+                const tp = (entry * 0.985).toFixed(2);
+                const sl = (entry * 1.006).toFixed(2);
+                const msg = `*BTC STRONG SELL* \nEntry: $${entry}\nTP: $${tp} (-1.5%)\nSL: $${sl} (+0.6%)\nRR: 1:2.5\n${reasonsSell.join(' • ')}`;
+                sendTelegram(msg);
+                document.getElementById('signal').innerHTML = `<div class="strong-sell">STRONG SELL SENT!</div>`;
+                lastSignalTime = Date.now();
+
+                // *** SOUND + NOTIFICATION ***
+                playSound();
+                showNotification('BTC PRO V7 – STRONG SELL', `Entry $${entry} | TP $${tp} | SL $${sl}`);
+            } 
+            else {
+                document.getElementById('signal').innerHTML = `<div class="neutral">BUY: ${scoreBuy}/5 | SELL: ${scoreSell}/5 - No Signal</div>`;
+            }
+        }
+
+        function checkNow() { fetchCandles(); }
+
+        // -------------------------------------------------
+        // INDICATOR FUNCTIONS
+        // -------------------------------------------------
+        function calcRSI(c, p) {
+            let avgGain = 0, avgLoss = 0;
+            for (let i = c.length - p; i < c.length; i++) {
+                const diff = c[i] - c[i-1];
+                if (diff > 0) avgGain += diff;
+                else avgLoss -= diff;
+            }
+            avgGain /= p; avgLoss /= p;
+            const rs = avgGain / (avgLoss || 1);
+            return 100 - (100 / (1 + rs));
+        }
+
+        function calcMACD(c) {
+            const ema12 = calcEMA(c,12);
+            const ema26 = calcEMA(c,26);
+            const line = ema12 - ema26;
+            const signal = calcEMA(c.map((_,i) => i >= c.length-9 ? line : 0).filter(x=>x), 9);
+            return {line, signal: signal || 0};
+        }
+
+        function calcBB(c, p, s) {
+            const sma = c.slice(-p).reduce((a,b)=>a+b,0)/p;
+            const dev = Math.sqrt(c.slice(-p).reduce((sum,v)=>sum+Math.pow(v-sma,2),0)/p);
+            return {upper: sma + s*dev, lower: sma - s*dev};
+        }
+
+        function calcEMA(c,p) {
+            const k = 2/(p+1);
+            let ema = c[0];
+            for(let i=1; i<c.length; i++) ema = c[i]*k + ema*(1-k);
+            return ema;
+        }
+
+        // -------------------------------------------------
+        // START
+        // -------------------------------------------------
+        connectWebSocket();
+        fetchCandles();
+        setInterval(fetchCandles, 30000);  // Every 30 sec
+    </script>
+</body>
+</html>
